@@ -5,21 +5,23 @@ import { blobToBase64, audioBufferToWav, downsampleAudioBuffer } from './utils/a
 import { generateSRT } from './utils/timeFormatter';
 import { ProcessingState, CaptionSegment } from './types';
 
-// 10-minute chunks are highly efficient for Gemini 3 Flash
-const CHUNK_DURATION = 600; 
-const MAX_RETRIES = 5;
-const REQUEST_DELAY = 12000; // 12 second "Neural Cooldown" to stay under 15 RPM
+// INCREASED: Gemini 3 Flash can handle massive audio files. 
+// Processing 1-hour blocks prevents "Quota Over" by reducing request count to 1 for most users.
+const CHUNK_DURATION = 3600; 
+const MAX_RETRIES = 8;
+const MIN_COOLDOWN = 15000; // 15s standard cooldown if needed
 
 const App: React.FC = () => {
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [status, setStatus] = useState<ProcessingState>({
     status: 'idle',
-    message: 'Import a video to begin ultra-fast translation.'
+    message: 'System Ready. Optimized for Long-Context Flash Processing.'
   });
   const [segments, setSegments] = useState<CaptionSegment[]>([]);
   const [progress, setProgress] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [cooldown, setCooldown] = useState(0);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
@@ -28,6 +30,13 @@ const App: React.FC = () => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [segments]);
 
+  useEffect(() => {
+    if (cooldown > 0) {
+      const timer = setTimeout(() => setCooldown(cooldown - 1), 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [cooldown]);
+
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
@@ -35,7 +44,7 @@ const App: React.FC = () => {
       setVideoUrl(URL.createObjectURL(file));
       setSegments([]);
       setProgress(0);
-      setStatus({ status: 'idle', message: 'Ready for analysis. Flash engine on standby.' });
+      setStatus({ status: 'idle', message: 'Video Imported. Ready for Neural Analysis.' });
     }
   };
 
@@ -43,7 +52,8 @@ const App: React.FC = () => {
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
       
-      const optimizedBuffer = await downsampleAudioBuffer(audioBuffer, 16000);
+      // Use 12kHz for maximum safety on payload size while maintaining high quality for the model
+      const optimizedBuffer = await downsampleAudioBuffer(audioBuffer, 12000);
       const wavBlob = audioBufferToWav(optimizedBuffer);
       const base64Data = await blobToBase64(wavBlob);
 
@@ -52,7 +62,7 @@ const App: React.FC = () => {
         contents: [{
           parts: [
             { inlineData: { mimeType: 'audio/wav', data: base64Data } },
-            { text: "Transcribe and translate this audio into natural English. Output: JSON array of objects {start, end, text}. Timing: seconds. Accuracy is critical." }
+            { text: "Precisely transcribe and translate this audio into natural English. Return a JSON array of objects with keys: start (float seconds), end (float seconds), and text (English string). Coverage must be 100%." }
           ]
         }],
         config: {
@@ -76,7 +86,7 @@ const App: React.FC = () => {
       const data = JSON.parse(jsonStr || "[]");
       
       const adjustedSegments = data.map((s: any, i: number) => ({
-        id: batchIndex * 1000 + i,
+        id: batchIndex * 10000 + i,
         start_seconds: s.start + offset,
         end_seconds: s.end + offset,
         text: s.text
@@ -89,21 +99,16 @@ const App: React.FC = () => {
 
       return true;
     } catch (error: any) {
-      console.error(`Batch ${batchIndex} Error:`, error);
-      
-      const errorMsg = error.message || "";
-      const isQuotaError = errorMsg.includes("429") || errorMsg.includes("RESOURCE_EXHAUSTED");
+      console.error(`Batch Error:`, error);
+      const isQuota = error.message?.includes("429") || error.message?.includes("RESOURCE_EXHAUSTED");
       
       if (retryCount < MAX_RETRIES) {
-        // Aggressive backoff for quota errors
-        const baseDelay = isQuotaError ? 20000 : 5000;
-        const delay = Math.pow(2, retryCount) * baseDelay + (Math.random() * 2000);
-        
+        const waitTime = isQuota ? 30 : 5;
+        const delay = Math.pow(1.5, retryCount) * waitTime * 1000;
+        setCooldown(Math.ceil(delay / 1000));
         setStatus({ 
           status: 'connecting', 
-          message: isQuotaError 
-            ? `Quota Exceeded. Cooling down for ${Math.round(delay/1000)}s...` 
-            : `Retrying batch ${batchIndex + 1}...` 
+          message: isQuota ? `Quota Limit Reached. Balancing Load...` : `Sync Error. Retrying...` 
         });
         
         await new Promise(r => setTimeout(r, delay));
@@ -118,7 +123,7 @@ const App: React.FC = () => {
 
     try {
       setIsProcessing(true);
-      setStatus({ status: 'connecting', message: 'Extracting High-Fidelity Audio...' });
+      setStatus({ status: 'connecting', message: 'Optimizing Neural Streams...' });
       
       const arrayBuffer = await videoFile.arrayBuffer();
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
@@ -126,6 +131,8 @@ const App: React.FC = () => {
       
       const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
       const duration = decodedBuffer.duration;
+      
+      // We use huge chunks to stay well under the 15 RPM limit.
       const numChunks = Math.ceil(duration / CHUNK_DURATION);
       const chunks = [];
 
@@ -137,41 +144,30 @@ const App: React.FC = () => {
         const frameCount = frameEnd - frameStart;
         
         const chunkBuffer = audioCtx.createBuffer(
-          decodedBuffer.numberOfChannels,
+          1, // Mono is enough for transcription and saves 50% bandwidth
           frameCount,
           decodedBuffer.sampleRate
         );
 
-        for (let channel = 0; channel < decodedBuffer.numberOfChannels; channel++) {
-          const channelData = decodedBuffer.getChannelData(channel).subarray(frameStart, frameEnd);
-          chunkBuffer.copyToChannel(channelData, channel);
-        }
+        const channelData = decodedBuffer.getChannelData(0).subarray(frameStart, frameEnd);
+        chunkBuffer.copyToChannel(channelData, 0);
         chunks.push({ buffer: chunkBuffer, offset: start });
       }
 
-      setStatus({ status: 'streaming', message: `Initializing Pipeline: ${numChunks} batches detected.` });
+      setStatus({ status: 'streaming', message: `Processing ${numChunks} massive batch(es)...` });
 
       for (let i = 0; i < chunks.length; i++) {
-        setStatus({ status: 'streaming', message: `Processing Batch ${i + 1} of ${chunks.length}...` });
         const success = await processBatchWithRetry(chunks[i].buffer, chunks[i].offset, i);
-        
-        if (!success) throw new Error("Processing suspended: API limits persistent.");
-        
+        if (!success) throw new Error("API Quota limits were too high to bypass. Try a smaller video or wait 1 minute.");
         setProgress(Math.round(((i + 1) / chunks.length) * 100));
-
-        // Add mandatory delay between batches to stay under 15 RPM
-        if (i < chunks.length - 1) {
-          setStatus({ status: 'connecting', message: `Batch ${i + 1} Done. Neural Cooldown (12s)...` });
-          await new Promise(r => setTimeout(r, REQUEST_DELAY));
-        }
       }
 
-      setStatus({ status: 'completed', message: 'Success. Full translation mapped to SRT.' });
+      setStatus({ status: 'completed', message: 'Analysis Complete. SRT Ready.' });
       setIsProcessing(false);
     } catch (error: any) {
       console.error(error);
       setIsProcessing(false);
-      setStatus({ status: 'error', message: error.message || 'The engine hit a fatal quota limit.' });
+      setStatus({ status: 'error', message: error.message || 'The engine encountered a fatal error.' });
     }
   };
 
@@ -181,50 +177,41 @@ const App: React.FC = () => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `PhilipAI_${videoFile?.name.split('.')[0] || 'subtitles'}.srt`;
+    a.download = `PhilipAI_Subtitles.srt`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
   };
 
   return (
-    <div className="min-h-screen p-4 md:p-12 flex flex-col items-center max-w-7xl mx-auto bg-[#020617] text-slate-100 selection:bg-emerald-500/30">
-      {/* Header */}
-      <header className="w-full mb-12 flex flex-col md:flex-row items-center justify-between gap-8 bg-slate-900/30 p-10 rounded-[4rem] border border-white/5 shadow-[0_0_50px_-12px_rgba(16,185,129,0.1)] backdrop-blur-2xl ring-1 ring-white/10">
-        <div className="flex items-center gap-8">
-          <div className="relative group">
-            <div className="absolute -inset-1 bg-gradient-to-r from-emerald-600 to-teal-500 rounded-[2.5rem] blur opacity-25 group-hover:opacity-75 transition duration-1000 group-hover:duration-200"></div>
-            <div className="relative w-20 h-20 bg-slate-900 rounded-[2.5rem] flex items-center justify-center border border-white/10 transform transition duration-500 hover:rotate-6">
-              <svg className="w-10 h-10 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M13 10V3L4 14h7v7l9-11h-7z" />
-              </svg>
-            </div>
+    <div className="min-h-screen p-6 md:p-12 flex flex-col items-center max-w-7xl mx-auto bg-[#020617] text-slate-100">
+      <header className="w-full mb-12 flex flex-col md:flex-row items-center justify-between gap-8 bg-slate-900/40 p-10 rounded-[3rem] border border-white/5 shadow-2xl backdrop-blur-xl">
+        <div className="flex items-center gap-6">
+          <div className="w-16 h-16 bg-emerald-500 rounded-2xl flex items-center justify-center shadow-lg shadow-emerald-500/20">
+            <svg className="w-8 h-8 text-slate-950" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z"/></svg>
           </div>
           <div>
-            <div className="flex items-center gap-4">
-              <h1 className="text-5xl font-black tracking-[0.05em] text-white">Philip<span className="text-emerald-500">AI</span></h1>
-              <span className="bg-emerald-500/10 text-emerald-400 text-[10px] font-black px-3 py-1.5 rounded-xl border border-emerald-500/20 uppercase tracking-[0.2em]">THROTTLED v3</span>
-            </div>
-            <p className="text-slate-500 text-xs font-bold uppercase tracking-[0.4em] mt-3 flex items-center gap-3">
-              <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-ping" />
-              Respecting API Quotas
-            </p>
+            <h1 className="text-4xl font-black text-white tracking-tight">Philip<span className="text-emerald-500">AI</span></h1>
+            <p className="text-slate-500 text-[10px] font-black uppercase tracking-[0.3em] mt-1">Massive Context Engine</p>
           </div>
         </div>
-        
-        <div className="flex flex-col items-end gap-3">
-          <div className={`px-8 py-3.5 rounded-3xl text-[11px] font-black border flex items-center gap-4 transition-all duration-500 shadow-2xl ${
-            isProcessing ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' :
-            status.status === 'completed' ? 'bg-blue-500/10 border-blue-500/30 text-blue-400' :
-            status.status === 'error' ? 'bg-red-500/10 border-red-500/30 text-red-400' :
-            'bg-slate-800/40 border-white/5 text-slate-500'
-          }`}>
-            <span className={`w-2.5 h-2.5 rounded-full ${isProcessing ? 'bg-emerald-500 animate-pulse' : status.status === 'error' ? 'bg-red-500' : 'bg-slate-600'}`} />
-            {status.status.toUpperCase()}
+
+        <div className="flex flex-col items-end gap-2">
+          <div className="flex gap-3">
+             {cooldown > 0 && (
+               <div className="px-4 py-2 bg-amber-500/10 border border-amber-500/20 rounded-xl text-amber-500 text-[10px] font-black animate-pulse">
+                 QUOTA COOLDOWN: {cooldown}s
+               </div>
+             )}
+             <div className={`px-6 py-2 rounded-xl text-[10px] font-black border transition-all ${
+               isProcessing ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400' : 'bg-slate-800 border-white/5 text-slate-400'
+             }`}>
+               STATUS: {status.status.toUpperCase()}
+             </div>
           </div>
           {isProcessing && (
-            <div className="w-56 h-2 bg-slate-800/50 rounded-full overflow-hidden border border-white/5">
-              <div className="h-full bg-gradient-to-r from-emerald-600 to-teal-400 transition-all duration-1000 ease-in-out" style={{ width: `${progress}%` }} />
+            <div className="w-48 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+              <div className="h-full bg-emerald-500 transition-all duration-700" style={{ width: `${progress}%` }} />
             </div>
           )}
         </div>
@@ -232,108 +219,86 @@ const App: React.FC = () => {
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 w-full">
         <div className="lg:col-span-8 space-y-8">
-          <div className="relative aspect-video bg-slate-950 rounded-[4rem] overflow-hidden border border-white/5 shadow-[0_25px_100px_-20px_rgba(0,0,0,0.6)] group ring-1 ring-white/10 transition-transform duration-700 hover:scale-[1.01]">
+          <div className="aspect-video bg-black rounded-[3rem] overflow-hidden border border-white/5 shadow-2xl relative group">
             {videoUrl ? (
               <video ref={videoRef} src={videoUrl} className="w-full h-full object-contain" controls />
             ) : (
-              <div className="absolute inset-0 flex flex-col items-center justify-center bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-slate-900 via-slate-950 to-black">
-                <label className="cursor-pointer group flex flex-col items-center">
-                  <div className="w-28 h-28 bg-slate-900 rounded-[3rem] flex items-center justify-center mb-10 group-hover:bg-emerald-600 transition-all duration-700 shadow-2xl group-hover:scale-110 border border-white/10 group-hover:border-emerald-400/50">
-                    <svg className="w-12 h-12 text-slate-500 group-hover:text-white transition-colors duration-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4" /></svg>
-                  </div>
-                  <span className="text-slate-500 font-black text-xl tracking-[0.3em] uppercase opacity-40 group-hover:opacity-100 group-hover:text-emerald-400 transition-all duration-500">Initialize Source</span>
-                  <input type="file" className="hidden" accept="video/*" onChange={handleFileChange} />
-                </label>
-              </div>
+              <label className="absolute inset-0 flex flex-col items-center justify-center cursor-pointer hover:bg-slate-900/50 transition-all">
+                <div className="w-20 h-20 bg-slate-900 rounded-full flex items-center justify-center mb-4 group-hover:scale-110 transition-transform">
+                  <svg className="w-8 h-8 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4" /></svg>
+                </div>
+                <span className="text-slate-500 font-bold uppercase tracking-widest text-xs">Import Video Source</span>
+                <input type="file" className="hidden" accept="video/*" onChange={handleFileChange} />
+              </label>
             )}
           </div>
 
-          <div className="bg-slate-900/20 p-12 rounded-[4rem] border border-white/5 shadow-2xl backdrop-blur-3xl flex flex-col md:flex-row items-center justify-between gap-10 ring-1 ring-white/5">
-            <div className="space-y-3">
-              <h4 className="text-white font-black text-2xl tracking-tight">Throttled Workspace</h4>
-              <p className="text-slate-500 text-sm font-medium leading-relaxed">
-                Sequential Batch Processing <br/>
-                <span className="text-emerald-500/80 font-bold">12s Cooldown Between Batches</span>
-              </p>
+          <div className="bg-slate-900/30 p-10 rounded-[3rem] border border-white/5 flex flex-col md:flex-row items-center justify-between gap-8">
+            <div className="flex flex-col gap-1">
+              <span className="text-emerald-500 font-black text-xs uppercase tracking-widest">Active Pipeline</span>
+              <h3 className="text-white text-xl font-bold">Safe-Mode Analysis</h3>
+              <p className="text-slate-500 text-xs">One-Pass Context Generation</p>
             </div>
-            
-            <div className="flex gap-5 w-full md:w-auto">
-              {!isProcessing ? (
-                <button 
-                  onClick={startProcessing}
-                  disabled={!videoUrl || isProcessing}
-                  className="group relative w-full md:w-auto overflow-hidden bg-emerald-600 hover:bg-emerald-500 disabled:opacity-30 text-white px-12 py-6 rounded-[2.2rem] font-black text-xl shadow-[0_20px_60px_-15px_rgba(16,185,129,0.4)] transition-all active:scale-95"
-                >
-                  <span className="relative z-10">Process Safely</span>
-                </button>
-              ) : (
-                <div className="w-full md:w-auto bg-slate-800/40 px-12 py-6 rounded-[2.2rem] text-slate-400 font-bold border border-white/5 flex items-center gap-6 shadow-xl backdrop-blur-md">
-                   <div className="w-5 h-5 border-[3px] border-emerald-500 border-t-transparent rounded-full animate-spin" />
-                   Processing... {progress}%
-                </div>
-              )}
-              
+            <div className="flex gap-4 w-full md:w-auto">
+              <button 
+                onClick={startProcessing}
+                disabled={!videoFile || isProcessing}
+                className="flex-1 md:flex-none bg-emerald-600 hover:bg-emerald-500 disabled:opacity-20 text-slate-950 font-black px-10 py-5 rounded-2xl transition-all shadow-xl shadow-emerald-600/10 active:scale-95"
+              >
+                {isProcessing ? 'Processing...' : 'Run Analysis'}
+              </button>
               <button 
                 onClick={downloadSRT}
                 disabled={segments.length === 0}
-                className="w-full md:w-auto bg-slate-800/40 hover:bg-slate-700 disabled:opacity-10 text-slate-200 px-10 py-6 rounded-[2.2rem] font-bold border border-white/10 shadow-xl transition-all"
+                className="flex-1 md:flex-none bg-slate-800 hover:bg-slate-700 disabled:opacity-20 text-white font-bold px-10 py-5 rounded-2xl border border-white/5 transition-all"
               >
-                Export SRT
+                Get SRT
               </button>
             </div>
           </div>
           
-          <div className="px-10">
-            <div className="flex items-center justify-center gap-4 py-4 px-8 bg-slate-900/30 rounded-full border border-white/5 inline-block mx-auto">
-              <span className={`text-[11px] font-black tracking-[0.4em] uppercase transition-all duration-700 ${isProcessing ? 'text-emerald-400 animate-pulse' : status.status === 'error' ? 'text-red-400' : 'text-slate-600'}`}>
-                {status.message}
-              </span>
-            </div>
+          <div className="text-center">
+            <p className="text-[10px] text-slate-600 font-black uppercase tracking-[0.4em] animate-pulse">
+              {status.message}
+            </p>
           </div>
         </div>
 
-        <div className="lg:col-span-4 h-[800px] lg:h-auto">
-          <div className="bg-slate-900/20 rounded-[4rem] border border-white/5 flex flex-col h-full shadow-[0_30px_100px_-20px_rgba(0,0,0,0.4)] overflow-hidden backdrop-blur-3xl ring-1 ring-white/5">
-            <div className="p-10 border-b border-white/5 flex items-center justify-between bg-slate-900/10">
-              <h3 className="text-2xl font-black text-white flex items-center gap-5">
-                <div className="w-2.5 h-10 bg-emerald-500 rounded-full shadow-[0_0_15px_rgba(16,185,129,0.5)]" />
-                Neural Feed
-              </h3>
-              <span className="bg-emerald-500/10 text-emerald-400 px-4 py-2 rounded-2xl text-[11px] font-black border border-emerald-500/20 uppercase tracking-tight shadow-inner">
-                {segments.length} BLOCKS
-              </span>
+        <div className="lg:col-span-4">
+          <div className="bg-slate-900/30 rounded-[3rem] border border-white/5 h-[700px] flex flex-col shadow-2xl overflow-hidden backdrop-blur-md">
+            <div className="p-8 border-b border-white/5 bg-slate-900/50">
+              <h2 className="text-white font-black uppercase tracking-widest text-sm flex items-center justify-between">
+                Neural Transcription
+                <span className="text-emerald-500 bg-emerald-500/10 px-3 py-1 rounded-lg text-[9px]">{segments.length} BLOCKS</span>
+              </h2>
             </div>
-
-            <div className="flex-1 overflow-y-auto p-8 space-y-6 custom-scrollbar bg-slate-950/10">
-              {segments.length === 0 && !isProcessing && (
-                <div className="h-full flex flex-col items-center justify-center text-center p-10 opacity-30">
-                  <p className="text-xl font-black text-white mb-2">Feed Empty</p>
-                  <p className="text-[10px] font-bold text-slate-500 uppercase tracking-[0.3em]">Awaiting Analysis</p>
+            
+            <div className="flex-1 overflow-y-auto p-6 space-y-4 custom-scrollbar">
+              {segments.length === 0 && (
+                <div className="h-full flex flex-col items-center justify-center opacity-20 italic text-sm">
+                  <p>Awaiting Signal...</p>
                 </div>
               )}
-
               {segments.map((seg, idx) => (
-                <div key={seg.id} className="animate-in fade-in slide-in-from-bottom-6 duration-700">
-                  <div className="bg-slate-800/30 p-7 rounded-[2.5rem] border border-white/5 hover:border-emerald-500/40 hover:bg-slate-800/50 transition-all duration-500 group shadow-lg">
-                    <div className="flex justify-between items-center mb-4">
-                      <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">BLOCK {idx + 1}</span>
-                      <span className="text-[10px] font-mono text-emerald-400 font-black bg-emerald-500/5 px-3 py-1.5 rounded-xl border border-emerald-500/10">
-                        {Math.floor(seg.start_seconds / 60)}:{(seg.start_seconds % 60).toFixed(0).padStart(2, '0')}
-                      </span>
-                    </div>
-                    <p className="text-slate-300 text-sm leading-relaxed font-bold group-hover:text-white transition-colors">
-                      {seg.text}
-                    </p>
+                <div key={seg.id} className="bg-slate-800/40 p-5 rounded-2xl border border-white/5 hover:border-emerald-500/30 transition-all group">
+                  <div className="flex justify-between items-center mb-2">
+                    <span className="text-[9px] font-black text-slate-600 uppercase tracking-tighter">SEG {idx + 1}</span>
+                    <span className="text-[9px] font-mono text-emerald-500 bg-emerald-500/5 px-2 py-1 rounded-md">
+                      {Math.floor(seg.start_seconds / 60)}:{(seg.start_seconds % 60).toFixed(1).padStart(4, '0')}
+                    </span>
                   </div>
+                  <p className="text-slate-300 text-xs leading-relaxed group-hover:text-white transition-colors">
+                    {seg.text}
+                  </p>
                 </div>
               ))}
               <div ref={transcriptEndRef} />
             </div>
-
-            <div className="p-10 bg-slate-900/40 border-t border-white/5">
-              <span className="text-[10px] text-slate-600 font-black uppercase tracking-[0.6em] block text-center">
-                Safe-Mode Active
-              </span>
+            
+            <div className="p-6 bg-slate-900/80 border-t border-white/5">
+               <div className="w-full h-1 bg-slate-800 rounded-full overflow-hidden">
+                 <div className={`h-full bg-emerald-500 ${isProcessing ? 'animate-shimmer' : ''}`} style={{ width: isProcessing ? '100%' : '0%' }} />
+               </div>
             </div>
           </div>
         </div>
@@ -341,9 +306,14 @@ const App: React.FC = () => {
 
       <style>{`
         .custom-scrollbar::-webkit-scrollbar { width: 4px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(16, 185, 129, 0.1); border-radius: 10px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(16, 185, 129, 0.3); }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.05); border-radius: 10px; }
+        @keyframes shimmer { 
+          0% { transform: translateX(-100%); }
+          100% { transform: translateX(100%); }
+        }
+        .animate-shimmer {
+          animation: shimmer 2s infinite linear;
+        }
       `}</style>
     </div>
   );

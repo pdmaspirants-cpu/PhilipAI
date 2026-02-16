@@ -12,10 +12,9 @@ export async function blobToBase64(blob: Blob): Promise<string> {
 }
 
 /**
- * Downsamples an AudioBuffer to a specific sample rate and converts to mono.
- * This is crucial for reducing payload size and avoiding RPC errors.
+ * Downsamples an AudioBuffer to a lower sample rate to keep base64 strings safe for API limits.
  */
-export async function downsampleAudioBuffer(buffer: AudioBuffer, targetSampleRate: number = 16000): Promise<AudioBuffer> {
+export async function downsampleAudioBuffer(buffer: AudioBuffer, targetSampleRate: number = 12000): Promise<AudioBuffer> {
   const offlineCtx = new OfflineAudioContext(1, buffer.duration * targetSampleRate, targetSampleRate);
   const source = offlineCtx.createBufferSource();
   source.buffer = buffer;
