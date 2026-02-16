@@ -1,0 +1,8 @@
+{
+  "name": "PhilipAI",
+  "description": "Professional real-time video transcriber and translator that generates YouTube-compatible SRT caption files using Gemini AI.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
