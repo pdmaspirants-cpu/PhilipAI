@@ -5,9 +5,10 @@ import { blobToBase64, audioBufferToWav, downsampleAudioBuffer } from './utils/a
 import { generateSRT } from './utils/timeFormatter';
 import { ProcessingState, CaptionSegment } from './types';
 
-// Large chunks (10 mins) are highly efficient for Gemini 3 Flash
+// 10-minute chunks are highly efficient for Gemini 3 Flash
 const CHUNK_DURATION = 600; 
 const MAX_RETRIES = 5;
+const REQUEST_DELAY = 12000; // 12 second "Neural Cooldown" to stay under 15 RPM
 
 const App: React.FC = () => {
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
@@ -40,7 +41,6 @@ const App: React.FC = () => {
 
   const processBatchWithRetry = async (audioBuffer: AudioBuffer, offset: number, batchIndex: number, retryCount = 0): Promise<boolean> => {
     try {
-      // Create a fresh instance for every batch to ensure the latest API Key is used
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
       
       const optimizedBuffer = await downsampleAudioBuffer(audioBuffer, 16000);
@@ -95,14 +95,15 @@ const App: React.FC = () => {
       const isQuotaError = errorMsg.includes("429") || errorMsg.includes("RESOURCE_EXHAUSTED");
       
       if (retryCount < MAX_RETRIES) {
-        const baseDelay = isQuotaError ? 15000 : 3000;
-        const delay = Math.pow(1.5, retryCount) * baseDelay + (Math.random() * 2000);
+        // Aggressive backoff for quota errors
+        const baseDelay = isQuotaError ? 20000 : 5000;
+        const delay = Math.pow(2, retryCount) * baseDelay + (Math.random() * 2000);
         
         setStatus({ 
           status: 'connecting', 
           message: isQuotaError 
-            ? `Vercel Pipeline: Waiting for Quota reset... (${Math.round(delay/1000)}s)` 
-            : `Stabilizing connection... (Attempt ${retryCount + 1})` 
+            ? `Quota Exceeded. Cooling down for ${Math.round(delay/1000)}s...` 
+            : `Retrying batch ${batchIndex + 1}...` 
         });
         
         await new Promise(r => setTimeout(r, delay));
@@ -117,12 +118,10 @@ const App: React.FC = () => {
 
     try {
       setIsProcessing(true);
-      setStatus({ status: 'connecting', message: 'Decrypting audio streams...' });
+      setStatus({ status: 'connecting', message: 'Extracting High-Fidelity Audio...' });
       
       const arrayBuffer = await videoFile.arrayBuffer();
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      
-      // Ensure context is running (browser policy fix)
       if (audioCtx.state === 'suspended') await audioCtx.resume();
       
       const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
@@ -150,21 +149,29 @@ const App: React.FC = () => {
         chunks.push({ buffer: chunkBuffer, offset: start });
       }
 
-      setStatus({ status: 'streaming', message: `Engine: Processing ${numChunks} Neural Batches via Vercel Edge...` });
+      setStatus({ status: 'streaming', message: `Initializing Pipeline: ${numChunks} batches detected.` });
 
       for (let i = 0; i < chunks.length; i++) {
-        setStatus({ status: 'streaming', message: `Syncing Batch ${i + 1}/${chunks.length}...` });
+        setStatus({ status: 'streaming', message: `Processing Batch ${i + 1} of ${chunks.length}...` });
         const success = await processBatchWithRetry(chunks[i].buffer, chunks[i].offset, i);
-        if (!success) throw new Error("Connection timed out. Persistent quota limit reached.");
+        
+        if (!success) throw new Error("Processing suspended: API limits persistent.");
+        
         setProgress(Math.round(((i + 1) / chunks.length) * 100));
+
+        // Add mandatory delay between batches to stay under 15 RPM
+        if (i < chunks.length - 1) {
+          setStatus({ status: 'connecting', message: `Batch ${i + 1} Done. Neural Cooldown (12s)...` });
+          await new Promise(r => setTimeout(r, REQUEST_DELAY));
+        }
       }
 
-      setStatus({ status: 'completed', message: 'Translation complete. SRT Ready for export.' });
+      setStatus({ status: 'completed', message: 'Success. Full translation mapped to SRT.' });
       setIsProcessing(false);
     } catch (error: any) {
       console.error(error);
       setIsProcessing(false);
-      setStatus({ status: 'error', message: error.message || 'The engine encountered a deployment-side error.' });
+      setStatus({ status: 'error', message: error.message || 'The engine hit a fatal quota limit.' });
     }
   };
 
@@ -182,7 +189,7 @@ const App: React.FC = () => {
 
   return (
     <div className="min-h-screen p-4 md:p-12 flex flex-col items-center max-w-7xl mx-auto bg-[#020617] text-slate-100 selection:bg-emerald-500/30">
-      {/* Dynamic Header */}
+      {/* Header */}
       <header className="w-full mb-12 flex flex-col md:flex-row items-center justify-between gap-8 bg-slate-900/30 p-10 rounded-[4rem] border border-white/5 shadow-[0_0_50px_-12px_rgba(16,185,129,0.1)] backdrop-blur-2xl ring-1 ring-white/10">
         <div className="flex items-center gap-8">
           <div className="relative group">
@@ -196,13 +203,11 @@ const App: React.FC = () => {
           <div>
             <div className="flex items-center gap-4">
               <h1 className="text-5xl font-black tracking-[0.05em] text-white">Philip<span className="text-emerald-500">AI</span></h1>
-              <div className="flex flex-col">
-                <span className="bg-emerald-500/10 text-emerald-400 text-[10px] font-black px-3 py-1.5 rounded-xl border border-emerald-500/20 uppercase tracking-[0.2em] shadow-lg shadow-emerald-500/10">FLASH v3</span>
-              </div>
+              <span className="bg-emerald-500/10 text-emerald-400 text-[10px] font-black px-3 py-1.5 rounded-xl border border-emerald-500/20 uppercase tracking-[0.2em]">THROTTLED v3</span>
             </div>
             <p className="text-slate-500 text-xs font-bold uppercase tracking-[0.4em] mt-3 flex items-center gap-3">
               <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-ping" />
-              Deployed on Vercel Edge
+              Respecting API Quotas
             </p>
           </div>
         </div>
@@ -218,7 +223,7 @@ const App: React.FC = () => {
             {status.status.toUpperCase()}
           </div>
           {isProcessing && (
-            <div className="w-56 h-2 bg-slate-800/50 rounded-full overflow-hidden border border-white/5 shadow-inner">
+            <div className="w-56 h-2 bg-slate-800/50 rounded-full overflow-hidden border border-white/5">
               <div className="h-full bg-gradient-to-r from-emerald-600 to-teal-400 transition-all duration-1000 ease-in-out" style={{ width: `${progress}%` }} />
             </div>
           )}
@@ -226,7 +231,6 @@ const App: React.FC = () => {
       </header>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 w-full">
-        {/* Main Workstation */}
         <div className="lg:col-span-8 space-y-8">
           <div className="relative aspect-video bg-slate-950 rounded-[4rem] overflow-hidden border border-white/5 shadow-[0_25px_100px_-20px_rgba(0,0,0,0.6)] group ring-1 ring-white/10 transition-transform duration-700 hover:scale-[1.01]">
             {videoUrl ? (
@@ -246,13 +250,10 @@ const App: React.FC = () => {
 
           <div className="bg-slate-900/20 p-12 rounded-[4rem] border border-white/5 shadow-2xl backdrop-blur-3xl flex flex-col md:flex-row items-center justify-between gap-10 ring-1 ring-white/5">
             <div className="space-y-3">
-              <h4 className="text-white font-black text-2xl tracking-tight flex items-center gap-4">
-                Workstation Alpha
-                <span className="text-[10px] font-mono text-emerald-500/60 bg-emerald-500/5 px-2 py-0.5 rounded border border-emerald-500/10">STABLE</span>
-              </h4>
+              <h4 className="text-white font-black text-2xl tracking-tight">Throttled Workspace</h4>
               <p className="text-slate-500 text-sm font-medium leading-relaxed">
-                Parallel Audio Stream Processing <br/>
-                <span className="text-emerald-500/80 font-bold">16kHz / Mono / Multi-Batch Array</span>
+                Sequential Batch Processing <br/>
+                <span className="text-emerald-500/80 font-bold">12s Cooldown Between Batches</span>
               </p>
             </div>
             
@@ -261,22 +262,21 @@ const App: React.FC = () => {
                 <button 
                   onClick={startProcessing}
                   disabled={!videoUrl || isProcessing}
-                  className="group relative w-full md:w-auto overflow-hidden bg-emerald-600 hover:bg-emerald-500 disabled:opacity-30 text-white px-12 py-6 rounded-[2.2rem] font-black text-xl shadow-[0_20px_60px_-15px_rgba(16,185,129,0.4)] transition-all active:scale-95 disabled:hover:bg-emerald-600"
+                  className="group relative w-full md:w-auto overflow-hidden bg-emerald-600 hover:bg-emerald-500 disabled:opacity-30 text-white px-12 py-6 rounded-[2.2rem] font-black text-xl shadow-[0_20px_60px_-15px_rgba(16,185,129,0.4)] transition-all active:scale-95"
                 >
-                  <span className="relative z-10">Run Flash Analysis</span>
-                  <div className="absolute inset-0 bg-gradient-to-r from-emerald-400 to-teal-400 opacity-0 group-hover:opacity-100 transition-opacity" />
+                  <span className="relative z-10">Process Safely</span>
                 </button>
               ) : (
                 <div className="w-full md:w-auto bg-slate-800/40 px-12 py-6 rounded-[2.2rem] text-slate-400 font-bold border border-white/5 flex items-center gap-6 shadow-xl backdrop-blur-md">
                    <div className="w-5 h-5 border-[3px] border-emerald-500 border-t-transparent rounded-full animate-spin" />
-                   Neural Processing {progress}%
+                   Processing... {progress}%
                 </div>
               )}
               
               <button 
                 onClick={downloadSRT}
                 disabled={segments.length === 0}
-                className="w-full md:w-auto bg-slate-800/40 hover:bg-slate-700 disabled:opacity-10 text-slate-200 px-10 py-6 rounded-[2.2rem] font-bold border border-white/10 shadow-xl transition-all hover:border-emerald-500/30"
+                className="w-full md:w-auto bg-slate-800/40 hover:bg-slate-700 disabled:opacity-10 text-slate-200 px-10 py-6 rounded-[2.2rem] font-bold border border-white/10 shadow-xl transition-all"
               >
                 Export SRT
               </button>
@@ -292,7 +292,6 @@ const App: React.FC = () => {
           </div>
         </div>
 
-        {/* Neural Feed Sidebar */}
         <div className="lg:col-span-4 h-[800px] lg:h-auto">
           <div className="bg-slate-900/20 rounded-[4rem] border border-white/5 flex flex-col h-full shadow-[0_30px_100px_-20px_rgba(0,0,0,0.4)] overflow-hidden backdrop-blur-3xl ring-1 ring-white/5">
             <div className="p-10 border-b border-white/5 flex items-center justify-between bg-slate-900/10">
@@ -307,21 +306,18 @@ const App: React.FC = () => {
 
             <div className="flex-1 overflow-y-auto p-8 space-y-6 custom-scrollbar bg-slate-950/10">
               {segments.length === 0 && !isProcessing && (
-                <div className="h-full flex flex-col items-center justify-center text-center p-10 opacity-30 transform scale-90">
-                  <div className="w-20 h-20 mb-8 text-emerald-400/50 bg-slate-900/50 rounded-full flex items-center justify-center border border-white/5">
-                    <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
-                  </div>
-                  <p className="text-xl font-black text-white mb-2">Neural Receiver Idle</p>
-                  <p className="text-[10px] font-bold text-slate-500 uppercase tracking-[0.3em]">Awaiting Flash Signal</p>
+                <div className="h-full flex flex-col items-center justify-center text-center p-10 opacity-30">
+                  <p className="text-xl font-black text-white mb-2">Feed Empty</p>
+                  <p className="text-[10px] font-bold text-slate-500 uppercase tracking-[0.3em]">Awaiting Analysis</p>
                 </div>
               )}
 
               {segments.map((seg, idx) => (
-                <div key={seg.id} className="animate-in fade-in slide-in-from-bottom-6 duration-700" style={{ animationDelay: `${idx * 0.05}s` }}>
+                <div key={seg.id} className="animate-in fade-in slide-in-from-bottom-6 duration-700">
                   <div className="bg-slate-800/30 p-7 rounded-[2.5rem] border border-white/5 hover:border-emerald-500/40 hover:bg-slate-800/50 transition-all duration-500 group shadow-lg">
                     <div className="flex justify-between items-center mb-4">
-                      <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest group-hover:text-emerald-500/60 transition-colors">BLOCK {idx + 1}</span>
-                      <span className="text-[10px] font-mono text-emerald-400 font-black bg-emerald-500/5 px-3 py-1.5 rounded-xl border border-emerald-500/10 group-hover:bg-emerald-500/10 transition-all">
+                      <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">BLOCK {idx + 1}</span>
+                      <span className="text-[10px] font-mono text-emerald-400 font-black bg-emerald-500/5 px-3 py-1.5 rounded-xl border border-emerald-500/10">
                         {Math.floor(seg.start_seconds / 60)}:{(seg.start_seconds % 60).toFixed(0).padStart(2, '0')}
                       </span>
                     </div>
@@ -335,13 +331,8 @@ const App: React.FC = () => {
             </div>
 
             <div className="p-10 bg-slate-900/40 border-t border-white/5">
-              <div className="flex justify-center gap-2 mb-6">
-                {[...Array(6)].map((_, i) => (
-                  <div key={i} className={`w-2 h-2 rounded-full ${isProcessing ? 'bg-emerald-500 animate-bounce' : 'bg-slate-800'}`} style={{ animationDelay: `${i * 0.15}s` }} />
-                ))}
-              </div>
               <span className="text-[10px] text-slate-600 font-black uppercase tracking-[0.6em] block text-center">
-                Vercel Optimized Edge Engine
+                Safe-Mode Active
               </span>
             </div>
           </div>
