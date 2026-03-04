@@ -1,5 +1,5 @@
 
-export type ProcessingEngine = 'titan' | 'silentwave' | 'globallink';
+export type ProcessingEngine = 'titan';
 
 export interface CaptionSegment {
   id: number;

@@ -8,16 +8,12 @@ import { ProcessingState, CaptionSegment, AnalyticsData, ModelMetric, Processing
 const MODEL_POOL = [
   { id: 'gemini-3-flash-preview', label: 'Flash 3.0', description: 'Optimal Balanced Core' },
   { id: 'gemini-2.5-flash-native-audio-preview-12-2025', label: 'Audio Native 2.5', description: 'Waveform Specialist' },
-  { id: 'gemini-3-pro-preview', label: 'Pro 3.0', description: 'Advanced Reasoning Logic' },
+  { id: 'gemini-3.1-pro-preview', label: 'Pro 3.1', description: 'Advanced Reasoning Logic' },
   { id: 'gemini-flash-lite-latest', label: 'Flash Lite', description: 'High-Throughput Fallback' }
 ];
 
-// Failover Sequence Map: Defines the recovery path for each processing mode
-const ENGINE_MAP: Record<ProcessingEngine, number[]> = {
-  titan: [0, 1, 2, 3],       // Standard balanced approach
-  silentwave: [1, 0, 3, 2],  // Starts with Native Audio for max transcription fidelity
-  globallink: [2, 0, 1, 3]   // Starts with Pro 3.0 for nuanced semantic translation
-};
+// Failover Sequence Map: Defines the recovery path for the neural core
+const FAILOVER_SEQUENCE = [0, 1, 2, 3]; // Flash 3.0 -> Audio Native -> Pro 3.0 -> Flash Lite
 
 const CHUNK_DURATION = 300; // 5-minute segments
 const REQUEST_GAP = 5000; // 5s gap between batches to prevent 429 rate limiting
@@ -45,12 +41,15 @@ interface Incident {
 const App: React.FC = () => {
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [videoFile, setVideoFile] = useState<File | null>(null);
-  const [selectedEngine, setSelectedEngine] = useState<ProcessingEngine>('titan');
+  const [selectedEngine] = useState<ProcessingEngine>('titan');
   const [status, setStatus] = useState<ProcessingState>({
     status: 'idle',
     message: 'Multi-Engine Neural Link Ready.'
   });
   const [segments, setSegments] = useState<CaptionSegment[]>([]);
+  const [summary, setSummary] = useState<string | null>(null);
+  const [insights, setInsights] = useState<string[]>([]);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
   const [activeModelId, setActiveModelId] = useState<string>(MODEL_POOL[0].id);
@@ -135,7 +134,7 @@ const App: React.FC = () => {
     attemptIndex: number = 0,
     retryCount: number = 0
   ): Promise<boolean> => {
-    const sequence = ENGINE_MAP[selectedEngine];
+    const sequence = FAILOVER_SEQUENCE;
     if (attemptIndex >= sequence.length) return false;
     if (!navigator.onLine) return false;
 
@@ -143,12 +142,7 @@ const App: React.FC = () => {
     const currentModel = MODEL_POOL[modelIdx];
     setActiveModelId(currentModel.id);
     
-    let systemInstruction = "Precisely transcribe and translate this audio into natural English. Return a JSON array of objects with: start (float seconds), end (float seconds), text (English string).";
-    if (selectedEngine === 'silentwave') {
-      systemInstruction = "Acting as a Whisper-class transcription specialist, prioritize verbatim acoustic fidelity. Translate any foreign speech into standard English. Output as JSON array: [{start, end, text}].";
-    } else if (selectedEngine === 'globallink') {
-      systemInstruction = "Acting as a high-precision translation agent (Meta NLLB style), perform deep semantic analysis. Translate foreign expressions into natural idiomatic English. Output as JSON array: [{start, end, text}].";
-    }
+    const systemInstruction = "Precisely transcribe and translate this audio into natural English. Return a JSON array of objects with: start (float seconds), end (float seconds), text (English string). Ensure the timing is accurate and the English is fluent and idiomatic.";
 
     const requestStart = performance.now();
 
@@ -160,7 +154,7 @@ const App: React.FC = () => {
 
       setStatus({ 
         status: 'streaming', 
-        message: `[${selectedEngine.toUpperCase()}] Batch ${batchIndex + 1} processing on ${currentModel.label}...` 
+        message: `Batch ${batchIndex + 1} processing on ${currentModel.label}...` 
       });
 
       const response = await ai.models.generateContent({
@@ -238,6 +232,104 @@ const App: React.FC = () => {
       }
       
       return false;
+    }
+  };
+
+  const handleSummarize = async () => {
+    if (segments.length === 0 || isAnalyzing) return;
+    setIsAnalyzing(true);
+    setStatus({ status: 'streaming', message: 'Neural Core: Generating Abstract Summary...' });
+    
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const fullText = segments.map(s => s.text).join(' ');
+      
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.1-pro-preview',
+        contents: [{
+          parts: [{ text: `Summarize the following video transcript concisely. Focus on the main message and key takeaways. Transcript: ${fullText}` }]
+        }]
+      });
+
+      setSummary(response.text || "No summary generated.");
+      setStatus({ status: 'completed', message: 'Neural Summary Link Established.' });
+    } catch (error: any) {
+      logIncident("Pro 3.1", "Analysis Fault", error.message, "critical");
+      setStatus({ status: 'error', message: "Failed to generate summary." });
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  const handleExtractInsights = async () => {
+    if (segments.length === 0 || isAnalyzing) return;
+    setIsAnalyzing(true);
+    setStatus({ status: 'streaming', message: 'Neural Core: Extracting Semantic Insights...' });
+    
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const fullText = segments.map(s => s.text).join(' ');
+      
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.1-pro-preview',
+        contents: [{
+          parts: [{ text: `Extract 3-5 key bullet points of insights from this transcript. Return only the bullet points. Transcript: ${fullText}` }]
+        }]
+      });
+
+      const lines = (response.text || "").split('\n').filter(l => l.trim().length > 0);
+      setInsights(lines);
+      setStatus({ status: 'completed', message: 'Semantic Insights Extracted.' });
+    } catch (error: any) {
+      logIncident("Pro 3.1", "Insight Fault", error.message, "critical");
+      setStatus({ status: 'error', message: "Failed to extract insights." });
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  const handleRefineTranscript = async () => {
+    if (segments.length === 0 || isAnalyzing) return;
+    setIsAnalyzing(true);
+    setStatus({ status: 'streaming', message: 'Neural Core: Refining Linguistic Structure...' });
+    
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      
+      // Process in batches if too long, but for now we'll try a single pass for the whole thing
+      // if it's within token limits.
+      const fullText = segments.map(s => s.text).join(' ');
+      
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.1-pro-preview',
+        contents: [{
+          parts: [{ text: `Act as a professional editor. Refine the following transcript for perfect grammar, punctuation, and clarity while maintaining the original meaning. Return the refined text only. Transcript: ${fullText}` }]
+        }]
+      });
+
+      const refinedText = response.text || "";
+      // This is a simple refinement that replaces the text but keeps the timing.
+      // In a real app, we might want to re-align, but for now, we'll just update the segments' text
+      // by splitting the refined text back into roughly the same number of segments.
+      const refinedWords = refinedText.split(' ');
+      const wordsPerSegment = Math.ceil(refinedWords.length / segments.length);
+      
+      const newSegments = segments.map((seg, i) => {
+        const start = i * wordsPerSegment;
+        const end = Math.min(start + wordsPerSegment, refinedWords.length);
+        return {
+          ...seg,
+          text: refinedWords.slice(start, end).join(' ')
+        };
+      });
+
+      setSegments(newSegments);
+      setStatus({ status: 'completed', message: 'Linguistic Refinement Complete.' });
+    } catch (error: any) {
+      logIncident("Pro 3.1", "Refinement Fault", error.message, "critical");
+      setStatus({ status: 'error', message: "Failed to refine transcript." });
+    } finally {
+      setIsAnalyzing(false);
     }
   };
 
@@ -349,31 +441,28 @@ const App: React.FC = () => {
           </div>
         </div>
 
-        {/* Engine Control Interface */}
-        <div className="flex-[2] glass-panel p-4 rounded-[2.5rem] grid grid-cols-1 md:grid-cols-3 gap-3 shadow-xl ring-1 ring-white/5">
-          {[
-            { id: 'titan', name: 'Titan Core', desc: 'Full Failover Stack', icon: 'M13 10V3L4 14h7v7l9-11h-7z', color: 'text-blue-400' },
-            { id: 'silentwave', name: 'SilentWave', desc: 'Whisper-Class Acoustic', icon: 'M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z', color: 'text-purple-400' },
-            { id: 'globallink', name: 'GlobalLink', desc: 'Meta High-Reasoning', icon: 'M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.065', color: 'text-amber-400' }
-          ].map((engine) => (
-            <button
-              key={engine.id}
-              disabled={isProcessing}
-              onClick={() => setSelectedEngine(engine.id as ProcessingEngine)}
-              className={`p-4 rounded-3xl border transition-all text-left flex flex-col gap-1 relative overflow-hidden group ${
-                selectedEngine === engine.id 
-                  ? 'bg-white/5 border-emerald-500/40 shadow-lg' 
-                  : 'bg-transparent border-white/5 opacity-50 hover:opacity-100 hover:border-white/10'
-              }`}
-            >
-              <div className="flex items-center gap-2">
-                <svg className={`w-4 h-4 ${engine.color}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d={engine.icon} /></svg>
-                <span className="text-xs font-black text-white uppercase">{engine.name}</span>
-              </div>
-              <p className="text-[9px] text-slate-500 font-medium leading-tight">{engine.desc}</p>
-              {selectedEngine === engine.id && <div className="absolute top-0 right-0 p-2"><div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-ping" /></div>}
-            </button>
-          ))}
+        {/* Engine Status Display */}
+        <div className="flex-[2.5] glass-panel p-8 rounded-[2.5rem] flex items-center justify-between shadow-xl ring-1 ring-white/5">
+          <div className="flex flex-col gap-2">
+            <span className="text-[10px] font-black text-emerald-500 uppercase tracking-[0.3em]">Active Neural Core</span>
+            <h3 className="text-2xl font-bold text-white tracking-tight">Titan-3 Multi-Model Grid</h3>
+            <p className="text-slate-500 text-xs">Auto-failover enabled across 4 high-performance models.</p>
+          </div>
+          <div className="flex items-center gap-4">
+            <div className="flex -space-x-3">
+              {MODEL_POOL.map((model, i) => (
+                <div 
+                  key={model.id} 
+                  title={model.label}
+                  className={`w-10 h-10 rounded-full border-2 border-slate-950 flex items-center justify-center text-[8px] font-bold ${
+                    activeModelId === model.id ? 'bg-emerald-500 text-slate-950' : 'bg-slate-800 text-slate-400'
+                  } transition-all duration-500`}
+                >
+                  {i + 1}
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       </header>
 
@@ -440,6 +529,68 @@ const App: React.FC = () => {
               {status.message}
             </p>
           </div>
+
+          {/* Content Intelligence Panel */}
+          {segments.length > 0 && (
+            <div className="glass-panel p-10 rounded-[3rem] shadow-xl border border-white/5 flex flex-col gap-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <div className="w-12 h-12 bg-emerald-500/10 rounded-2xl flex items-center justify-center border border-emerald-500/20">
+                    <svg className="w-6 h-6 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>
+                  </div>
+                  <div>
+                    <h3 className="text-xl font-bold text-white tracking-tight">Content Intelligence</h3>
+                    <p className="text-slate-500 text-xs uppercase tracking-widest font-black">Powered by Gemini Pro 3.1</p>
+                  </div>
+                </div>
+                <div className="flex gap-3">
+                  <button 
+                    onClick={handleSummarize}
+                    disabled={isAnalyzing || isProcessing}
+                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-20 text-white font-bold text-[10px] uppercase tracking-widest rounded-xl border border-white/5 transition-all"
+                  >
+                    Summarize
+                  </button>
+                  <button 
+                    onClick={handleExtractInsights}
+                    disabled={isAnalyzing || isProcessing}
+                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-20 text-white font-bold text-[10px] uppercase tracking-widest rounded-xl border border-white/5 transition-all"
+                  >
+                    Insights
+                  </button>
+                  <button 
+                    onClick={handleRefineTranscript}
+                    disabled={isAnalyzing || isProcessing}
+                    className="px-4 py-2 bg-emerald-500/10 hover:bg-emerald-500/20 disabled:opacity-20 text-emerald-500 font-bold text-[10px] uppercase tracking-widest rounded-xl border border-emerald-500/20 transition-all"
+                  >
+                    Neural Refine
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {summary && (
+                  <div className="bg-slate-950/40 p-6 rounded-[2rem] border border-white/5 animate-in fade-in zoom-in-95 duration-300">
+                    <h4 className="text-[10px] font-black text-emerald-500 uppercase tracking-widest mb-3">Abstract Summary</h4>
+                    <p className="text-slate-300 text-sm leading-relaxed">{summary}</p>
+                  </div>
+                )}
+                {insights.length > 0 && (
+                  <div className="bg-slate-950/40 p-6 rounded-[2rem] border border-white/5 animate-in fade-in zoom-in-95 duration-300">
+                    <h4 className="text-[10px] font-black text-blue-400 uppercase tracking-widest mb-3">Key Takeaways</h4>
+                    <ul className="space-y-2">
+                      {insights.map((insight, i) => (
+                        <li key={i} className="text-slate-300 text-sm flex gap-3">
+                          <span className="text-blue-400 font-bold">•</span>
+                          {insight.replace(/^[*-]\s*/, '')}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Sidebar: Analytics & Diagnostic Stream */}
