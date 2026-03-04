@@ -27,6 +27,13 @@ const App: React.FC = () => {
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
+      // Vercel Hobby limit is 4.5MB. Pro is 15MB.
+      if (file.size > 15 * 1024 * 1024) {
+        setStatus({ type: 'error', message: 'Fault: Video exceeds Vercel payload limits (15MB). Please use a smaller clip.' });
+        return;
+      }
+      
+      if (videoUrl) URL.revokeObjectURL(videoUrl);
       setVideoFile(file);
       setVideoUrl(URL.createObjectURL(file));
       setSrtContent('');
@@ -35,20 +42,36 @@ const App: React.FC = () => {
     }
   };
 
+  // Cleanup object URL on unmount
+  useEffect(() => {
+    return () => {
+      if (videoUrl) URL.revokeObjectURL(videoUrl);
+    };
+  }, [videoUrl]);
+
   const parseSRT = (srt: string): CaptionSegment[] => {
-    const blocks = srt.split(/\n\s*\n/);
+    // 1. Strip markdown code blocks if present
+    const cleanSrt = srt.replace(/```[a-z]*\n?/gi, '').replace(/```/g, '').trim();
+    
+    // 2. Normalize line endings and split by double newline
+    const blocks = cleanSrt.split(/\r?\n\s*\r?\n/);
+    
     return blocks.map((block, index) => {
-      const lines = block.split('\n');
+      const lines = block.trim().split(/\r?\n/);
       if (lines.length < 3) return null;
       
-      const timeMatch = lines[1].match(/(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})/);
+      // Find the line that contains the timestamp
+      const timeLineIndex = lines.findIndex(l => l.includes('-->'));
+      if (timeLineIndex === -1) return null;
+
+      const timeMatch = lines[timeLineIndex].match(/(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})/);
       if (!timeMatch) return null;
 
       return {
         id: index,
         start: timeMatch[1],
         end: timeMatch[2],
-        text: lines.slice(2).join(' ')
+        text: lines.slice(timeLineIndex + 1).join(' ')
       };
     }).filter(Boolean) as CaptionSegment[];
   };
