@@ -28,3 +28,12 @@ export interface AnalyticsData {
   endTime: number | null;
   modelMetrics: Record<string, ModelMetric>;
 }
+
+declare global {
+  interface Window {
+    aistudio?: {
+      hasSelectedApiKey: () => Promise<boolean>;
+      openSelectKey: () => Promise<void>;
+    };
+  }
+}

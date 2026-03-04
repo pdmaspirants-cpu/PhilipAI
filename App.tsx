@@ -56,11 +56,20 @@ const App: React.FC = () => {
   const [analytics, setAnalytics] = useState<AnalyticsData>(INITIAL_ANALYTICS);
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [hasKey, setHasKey] = useState(true);
 
   const transcriptEndRef = useRef<HTMLDivElement>(null);
 
-  // Connectivity monitoring for failover safety
+  // Connectivity and API Key monitoring
   useEffect(() => {
+    const checkKey = async () => {
+      if (window.aistudio?.hasSelectedApiKey) {
+        const selected = await window.aistudio.hasSelectedApiKey();
+        setHasKey(selected);
+      }
+    };
+    
+    checkKey();
     const handleStatusChange = () => setIsOnline(navigator.onLine);
     window.addEventListener('online', handleStatusChange);
     window.addEventListener('offline', handleStatusChange);
@@ -326,10 +335,20 @@ const App: React.FC = () => {
       setSegments(newSegments);
       setStatus({ status: 'completed', message: 'Linguistic Refinement Complete.' });
     } catch (error: any) {
+      if (error.message?.includes("entity was not found")) {
+        setHasKey(false);
+      }
       logIncident("Pro 3.1", "Refinement Fault", error.message, "critical");
       setStatus({ status: 'error', message: "Failed to refine transcript." });
     } finally {
       setIsAnalyzing(false);
+    }
+  };
+
+  const handleOpenKeyDialog = async () => {
+    if (window.aistudio?.openSelectKey) {
+      await window.aistudio.openSelectKey();
+      setHasKey(true);
     }
   };
 
@@ -432,12 +451,22 @@ const App: React.FC = () => {
             </div>
           </div>
           
-          <div>
-            <h1 className="text-4xl font-black tracking-tighter text-white">Philip<span className="text-emerald-500">AI</span></h1>
-            <p className="text-[10px] font-black uppercase tracking-[0.4em] text-slate-500 mt-1 flex items-center gap-2">
-              <span className={`w-1.5 h-1.5 rounded-full ${isOnline ? 'bg-emerald-500' : 'bg-red-500 animate-ping'}`} />
-              {isOnline ? 'Neural Link Ready' : 'Core Connection Interrupted'}
-            </p>
+          <div className="flex items-center gap-6">
+            <div>
+              <h1 className="text-4xl font-black tracking-tighter text-white">Philip<span className="text-emerald-500">AI</span></h1>
+              <p className="text-[10px] font-black uppercase tracking-[0.4em] text-slate-500 mt-1 flex items-center gap-2">
+                <span className={`w-1.5 h-1.5 rounded-full ${isOnline ? 'bg-emerald-500' : 'bg-red-500 animate-ping'}`} />
+                {isOnline ? 'Neural Link Ready' : 'Core Connection Interrupted'}
+              </p>
+            </div>
+            {!hasKey && (
+              <button 
+                onClick={handleOpenKeyDialog}
+                className="ml-auto bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500 text-[10px] font-black uppercase tracking-widest px-4 py-2 rounded-xl border border-emerald-500/20 transition-all animate-pulse"
+              >
+                Connect API Key
+              </button>
+            )}
           </div>
         </div>
 
